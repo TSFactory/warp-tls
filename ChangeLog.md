@@ -1,3 +1,7 @@
+## 3.2.4.1
+
+* Backport a windows async exceptions fix from upstream warp-tls-3.2.7
+
 ## 3.2.2
 
 * New settting parameter: tlsServerDHEParams [#556](https://github.com/yesodweb/wai/pull/556)

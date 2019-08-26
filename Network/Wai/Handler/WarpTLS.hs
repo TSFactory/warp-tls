@@ -64,6 +64,8 @@ import Network.Wai (Application)
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal
 import System.IO.Error (isEOFError)
+import Control.Concurrent (forkIO)
+import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 
 ----------------------------------------------------------------
 
@@ -305,8 +307,18 @@ alpn xs
 
 getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Transport), SockAddr)
 getter tlsset@TLSSettings{..} sock params = do
-    (s, sa) <- accept sock
+    (s, sa) <- windowsThreadBlockHack $ accept sock
     return (mkConn tlsset s params, sa)
+  where
+  -- | Allow main socket listening thread to be interrupted on Windows platform
+  windowsThreadBlockHack :: IO a -> IO a
+  windowsThreadBlockHack act = do
+      var <- newEmptyMVar :: IO (MVar (Either SomeException a))
+      void . forkIO $ try act >>= putMVar var
+      res <- takeMVar var
+      case res of
+        Left  e -> throwIO e
+        Right r -> return r
 
 mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport)
 mkConn tlsset s params = switch `onException` sClose s

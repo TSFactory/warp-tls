@@ -47,7 +47,7 @@ module Network.Wai.Handler.WarpTLS (
 import Control.Applicative ((<$>))
 #endif
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..), handleJust)
+import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, handleJust)
 import qualified Control.Exception as E
 import Control.Monad (void, guard)
 import qualified Data.ByteString as S
@@ -56,6 +56,7 @@ import Data.Default.Class (def)
 import qualified Data.IORef as I
 import Data.Streaming.Network (bindPortTCP, safeRecv)
 import Data.Typeable (Typeable)
+import GHC.IO.Exception (IOErrorType(..))
 import Network.Socket (Socket, close, withSocketsDo, SockAddr, accept)
 #if MIN_VERSION_network(3,1,1)
 import Network.Socket (gracefulClose)
@@ -68,7 +69,7 @@ import qualified Network.TLS.SessionManager as SM
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal
-import System.IO.Error (isEOFError)
+import System.IO.Error (isEOFError, ioeGetErrorType)
 
 ----------------------------------------------------------------
 
@@ -365,15 +366,19 @@ httpOverTls TLSSettings{..} _set s bs0 params = do
     backend recvN = TLS.Backend {
         TLS.backendFlush = return ()
 #if MIN_VERSION_network(3,1,1)
-      , TLS.backendClose = gracefulClose s 5000 `E.catch` \(SomeException _) -> return ()
+      , TLS.backendClose = gracefulClose s 5000 `E.catch` \(E.SomeException _) -> return ()
 #else
       , TLS.backendClose = close s
 #endif
       , TLS.backendSend  = sendAll' s
       , TLS.backendRecv  = recvN
       }
-    sendAll' sock bs = sendAll sock bs `E.catch` \(SomeException _) ->
-        throwIO ConnectionClosedByPeer
+    sendAll' sock bs = E.handleJust
+      (\ e -> if ioeGetErrorType e == ResourceVanished
+        then Just ConnectionClosedByPeer
+        else Nothing)
+      throwIO
+      $ sendAll sock bs
     conn ctx writeBuf ref isH2 = Connection {
         connSendMany         = TLS.sendData ctx . L.fromChunks
       , connSendAll          = sendall

@@ -1,6 +1,60 @@
-## 3.2.4.1
+## 3.3.0
 
-* Backport a windows async exceptions fix from upstream warp-tls-3.2.7
+* Breaking changes: certFile and keyFile are not exported anymore.
+* Allow TLS credentials to be retrieved from an IORef.
+  [#806](https://github.com/yesodweb/wai/pull/806)
+
+## 3.2.12
+
+* A config field: tlsCredentials and tlsSessionManager.
+  [#805](https://github.com/yesodweb/wai/pull/805)
+
+## 3.2.11
+
+* Ignoring an exception from shutdown (gracefulClose).
+
+## 3.2.10
+
+* Passing client certificate, if any, to Warp
+  [#783](https://github.com/yesodweb/wai/pull/783)
+
+## 3.2.9
+
+* Cooperating setGracefulCloseTimeout1 and setGracefulCloseTimeout2 of Warp.
+  [#782](https://github.com/yesodweb/wai/pull/782)
+
+## 3.2.8
+
+* Using gracefullClose of network 3.1.1 or later if available.
+
+## 3.2.7
+
+* Relaxing version constraint.
+
+## 3.2.6
+
+* Using the Strict and StrictData language extensions for GHC >8.
+  [#752](https://github.com/yesodweb/wai/pull/752)
+
+## 3.2.5
+
+* When tls 1.5.0 is available, TLS 1.3 is automatically supported.
+
+## 3.2.4.3
+
+* Using warp >= 3.2.17.
+
+## 3.2.4.2
+
+* Ignore socket errors while sending `close_notify` [#640](https://github.com/yesodweb/wai/issues/640)
+
+## 3.2.4
+
+* Using tls-session-manager.
+
+## 3.2.3
+
+* Stop using obsoleted APIs of network.
 
 ## 3.2.2
 

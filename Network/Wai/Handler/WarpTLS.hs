@@ -4,7 +4,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE CPP #-}
 
 -- | HTTP over TLS support for Warp via the TLS package.
 --
@@ -14,72 +13,94 @@
 --   Support for SSL is now obsoleted.
 
 module Network.Wai.Handler.WarpTLS (
+    -- * Runner
+      runTLS
+    , runTLSSocket
     -- * Settings
-      TLSSettings
+    , TLSSettings
     , defaultTlsSettings
     -- * Smart constructors
+    -- ** From files
     , tlsSettings
-    , tlsSettingsMemory
     , tlsSettingsChain
+    -- ** From memory
+    , tlsSettingsMemory
     , tlsSettingsChainMemory
+    -- ** From references
+    , tlsSettingsRef
+    , tlsSettingsChainRef
     -- * Accessors
-    , certFile
-    , keyFile
+    , tlsCredentials
     , tlsLogging
     , tlsAllowedVersions
     , tlsCiphers
     , tlsWantClientCert
     , tlsServerHooks
     , tlsServerDHEParams
+    , tlsSessionManagerConfig
+    , tlsSessionManager
     , onInsecure
     , OnInsecure (..)
-    -- * Runner
-    , runTLS
-    , runTLSSocket
     -- * Exception
     , WarpTLSException (..)
+    -- * DH parameters (re-exports)
+    --
+    -- | This custom DH parameters are not necessary anymore because
+    --   pre-defined DH parameters are supported in the TLS package.
     , DH.Params
     , DH.generateParams
     ) where
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative ((<$>))
-#endif
 import Control.Applicative ((<|>))
-import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..))
+import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, SomeException(..), handleJust)
 import qualified Control.Exception as E
-import Control.Monad (void)
+import Control.Monad (void, guard)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Lazy as L
 import Data.Default.Class (def)
 import qualified Data.IORef as I
 import Data.Streaming.Network (bindPortTCP, safeRecv)
 import Data.Typeable (Typeable)
-import Network.Socket (Socket, sClose, withSocketsDo, SockAddr, accept)
+import GHC.IO.Exception (IOErrorType(..))
+import Network.Socket (Socket, close, withSocketsDo, SockAddr, accept)
+#if MIN_VERSION_network(3,1,1)
+import Network.Socket (gracefulClose)
+#endif
 import Network.Socket.ByteString (sendAll)
 import qualified Network.TLS as TLS
 import qualified Crypto.PubKey.DH as DH
 import qualified Network.TLS.Extra as TLSExtra
+import qualified Network.TLS.SessionManager as SM
 import Network.Wai (Application)
 import Network.Wai.Handler.Warp
 import Network.Wai.Handler.Warp.Internal
-import System.IO.Error (isEOFError)
-import Control.Concurrent (forkIO)
-import Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
+import System.IO.Error (isEOFError, ioeGetErrorType)
+
+----------------------------------------------------------------
+
+-- | Determines where to load the certificate, chain 
+-- certificates, and key from.
+data CertSettings 
+  = CertFromFile !FilePath ![FilePath] !FilePath
+  | CertFromMemory !S.ByteString ![S.ByteString] !S.ByteString
+  | CertFromRef !(I.IORef S.ByteString) ![I.IORef S.ByteString] !(I.IORef S.ByteString)
+
+-- | The default 'CertSettings'.
+defaultCertSettings :: CertSettings
+defaultCertSettings = CertFromFile "certificate.pem" [] "key.pem"
 
 ----------------------------------------------------------------
 
 -- | Settings for WarpTLS.
 data TLSSettings = TLSSettings {
-    certFile :: FilePath
-    -- ^ File containing the certificate.
-  , chainCertFiles :: [FilePath]
-    -- ^ Files containing chain certificates.
-  , keyFile :: FilePath
-    -- ^ File containing the key
-  , certMemory :: Maybe S.ByteString
-  , chainCertsMemory :: [S.ByteString]
-  , keyMemory :: Maybe S.ByteString
+    certSettings :: CertSettings
+    -- ^ Where are the certificate, chain certificates, and key
+    -- loaded from?
+    --
+    -- >>> certSettings defaultTlsSettings
+    -- tlsSettings "certificate.pem" "key.pem"
+    -- 
+    -- @since 3.3.0
   , onInsecure :: OnInsecure
     -- ^ Do we allow insecure connections with this server as well?
     --
@@ -94,19 +115,37 @@ data TLSSettings = TLSSettings {
     --
     -- Since 1.4.0
   , tlsAllowedVersions :: [TLS.Version]
+#if MIN_VERSION_tls(1,5,0)
+    -- ^ The TLS versions this server accepts.
+    --
+    -- >>> tlsAllowedVersions defaultTlsSettings
+    -- [TLS13,TLS12,TLS11,TLS10]
+    --
+    -- Since 1.4.2
+#else
     -- ^ The TLS versions this server accepts.
     --
     -- >>> tlsAllowedVersions defaultTlsSettings
     -- [TLS12]
     --
     -- Since 1.4.2
+#endif
   , tlsCiphers :: [TLS.Cipher]
+#if MIN_VERSION_tls(1,5,0)
     -- ^ The TLS ciphers this server accepts.
     --
     -- >>> tlsCiphers defaultTlsSettings
-    -- [ECDHE-RSA-AES128GCM-SHA256,DHE-RSA-AES128GCM-SHA256,DHE-RSA-AES256-SHA256,DHE-RSA-AES128-SHA256,DHE-RSA-AES256-SHA1,DHE-RSA-AES128-SHA1,DHE-DSA-AES128-SHA1,DHE-DSA-AES256-SHA1,RSA-aes128-sha1,RSA-aes256-sha1]
+    -- [ECDHE-ECDSA-AES256GCM-SHA384,ECDHE-ECDSA-AES128GCM-SHA256,ECDHE-RSA-AES256GCM-SHA384,ECDHE-RSA-AES128GCM-SHA256,DHE-RSA-AES256GCM-SHA384,DHE-RSA-AES128GCM-SHA256,ECDHE-ECDSA-AES256CBC-SHA384,ECDHE-RSA-AES256CBC-SHA384,DHE-RSA-AES256-SHA256,ECDHE-ECDSA-AES256CBC-SHA,ECDHE-RSA-AES256CBC-SHA,DHE-RSA-AES256-SHA1,RSA-AES256GCM-SHA384,RSA-AES256-SHA256,RSA-AES256-SHA1,AES128GCM-SHA256,AES256GCM-SHA384]
     --
     -- Since 1.4.2
+#else
+    -- ^ The TLS ciphers this server accepts.
+    --
+    -- >>> tlsCiphers defaultTlsSettings
+    -- [ECDHE-ECDSA-AES256GCM-SHA384,ECDHE-ECDSA-AES128GCM-SHA256,ECDHE-RSA-AES256GCM-SHA384,ECDHE-RSA-AES128GCM-SHA256,DHE-RSA-AES256GCM-SHA384,DHE-RSA-AES128GCM-SHA256,ECDHE-ECDSA-AES256CBC-SHA384,ECDHE-RSA-AES256CBC-SHA384,DHE-RSA-AES256-SHA256,ECDHE-ECDSA-AES256CBC-SHA,ECDHE-RSA-AES256CBC-SHA,DHE-RSA-AES256-SHA1,RSA-AES256GCM-SHA384,RSA-AES256-SHA256,RSA-AES256-SHA1]
+    --
+    -- Since 1.4.2
+#endif
   , tlsWantClientCert :: Bool
     -- ^ Whether or not to demand a certificate from the client.  If this
     -- is set to True, you must handle received certificates in a server hook
@@ -131,42 +170,50 @@ data TLSSettings = TLSSettings {
     -- Default: Nothing
     --
     -- Since 3.2.2
+  , tlsSessionManagerConfig :: Maybe SM.Config
+    -- ^ Configuration for in-memory TLS session manager.
+    -- If Nothing, 'TLS.noSessionManager' is used.
+    -- Otherwise, an in-memory TLS session manager is created
+    -- according to 'Config'.
+    --
+    -- Default: Nothing
+    --
+    -- Since 3.2.4
+  , tlsCredentials :: Maybe TLS.Credentials
+    -- ^ Specifying 'TLS.Credentials' directly.  If this value is
+    --   specified, other fields such as 'certFile' are ignored.
+    --
+    --   Since 3.2.12
+  , tlsSessionManager :: Maybe TLS.SessionManager
+    -- ^ Specifying 'TLS.SessionManager' directly. If this value is
+    --   specified, 'tlsSessionManagerConfig' is ignored.
+    --
+    --   Since 3.2.12
   }
 
 -- | Default 'TLSSettings'. Use this to create 'TLSSettings' with the field record name (aka accessors).
 defaultTlsSettings :: TLSSettings
 defaultTlsSettings = TLSSettings {
-    certFile = "certificate.pem"
-  , chainCertFiles = []
-  , keyFile = "key.pem"
-  , certMemory = Nothing
-  , chainCertsMemory = []
-  , keyMemory = Nothing
+    certSettings = defaultCertSettings
   , onInsecure = DenyInsecure "This server only accepts secure HTTPS connections."
   , tlsLogging = def
+#if MIN_VERSION_tls(1,5,0)
+  , tlsAllowedVersions = [TLS.TLS13,TLS.TLS12]
+#else
   , tlsAllowedVersions = [TLS.TLS12]
+#endif
   , tlsCiphers = ciphers
   , tlsWantClientCert = False
   , tlsServerHooks = def
   , tlsServerDHEParams = Nothing
+  , tlsSessionManagerConfig = Nothing
+  , tlsCredentials = Nothing
+  , tlsSessionManager = Nothing
   }
 
 -- taken from stunnel example in tls-extra
 ciphers :: [TLS.Cipher]
-ciphers =
-    [ TLSExtra.cipher_ECDHE_RSA_AES128GCM_SHA256
-    , TLSExtra.cipher_ECDHE_RSA_AES128CBC_SHA256
-    , TLSExtra.cipher_ECDHE_RSA_AES128CBC_SHA
-    , TLSExtra.cipher_DHE_RSA_AES128GCM_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES256_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES128_SHA256
-    , TLSExtra.cipher_DHE_RSA_AES256_SHA1
-    , TLSExtra.cipher_DHE_RSA_AES128_SHA1
-    , TLSExtra.cipher_DHE_DSS_AES128_SHA1
-    , TLSExtra.cipher_DHE_DSS_AES256_SHA1
-    , TLSExtra.cipher_AES128_SHA1
-    , TLSExtra.cipher_AES256_SHA1
-    ]
+ciphers = TLSExtra.ciphersuite_strong
 
 ----------------------------------------------------------------
 
@@ -182,8 +229,7 @@ tlsSettings :: FilePath -- ^ Certificate file
             -> FilePath -- ^ Key file
             -> TLSSettings
 tlsSettings cert key = defaultTlsSettings {
-    certFile = cert
-  , keyFile = key
+    certSettings = CertFromFile cert [] key
   }
 
 -- | A smart constructor for 'TLSSettings' that allows specifying
@@ -196,9 +242,7 @@ tlsSettingsChain
             -> FilePath -- ^ Key file
             -> TLSSettings
 tlsSettingsChain cert chainCerts key = defaultTlsSettings {
-    certFile = cert
-  , chainCertFiles = chainCerts
-  , keyFile = key
+    certSettings = CertFromFile cert chainCerts key
   }
 
 -- | A smart constructor for 'TLSSettings', but uses in-memory representations
@@ -209,10 +253,9 @@ tlsSettingsMemory
     :: S.ByteString -- ^ Certificate bytes
     -> S.ByteString -- ^ Key bytes
     -> TLSSettings
-tlsSettingsMemory cert key = defaultTlsSettings
-    { certMemory = Just cert
-    , keyMemory = Just key
-    }
+tlsSettingsMemory cert key = defaultTlsSettings { 
+    certSettings = CertFromMemory cert [] key
+  }
 
 -- | A smart constructor for 'TLSSettings', but uses in-memory representations
 -- of the certificate and key based on 'defaultTlsSettings'.
@@ -223,11 +266,34 @@ tlsSettingsChainMemory
     -> [S.ByteString] -- ^ Chain certificate bytes
     -> S.ByteString -- ^ Key bytes
     -> TLSSettings
-tlsSettingsChainMemory cert chainCerts key = defaultTlsSettings
-    { certMemory = Just cert
-    , chainCertsMemory = chainCerts
-    , keyMemory = Just key
-    }
+tlsSettingsChainMemory cert chainCerts key = defaultTlsSettings { 
+    certSettings = CertFromMemory cert chainCerts key
+  }
+
+-- | A smart constructor for 'TLSSettings', but uses references to in-memory
+-- representations of the certificate and key based on 'defaultTlsSettings'.
+--
+-- @since 3.3.0
+tlsSettingsRef 
+    :: I.IORef S.ByteString -- ^ Reference to certificate bytes
+    -> I.IORef (S.ByteString) -- ^ Reference to key bytes 
+    -> TLSSettings 
+tlsSettingsRef cert key = defaultTlsSettings { 
+    certSettings = CertFromRef cert [] key
+  }
+
+-- | A smart constructor for 'TLSSettings', but uses references to in-memory
+-- representations of the certificate and key based on 'defaultTlsSettings'.
+--
+-- @since 3.3.0
+tlsSettingsChainRef 
+    :: I.IORef S.ByteString -- ^ Reference to certificate bytes
+    -> [I.IORef S.ByteString] -- ^ Reference to chain certificate bytes
+    -> I.IORef (S.ByteString) -- ^ Reference to key bytes 
+    -> TLSSettings 
+tlsSettingsChainRef cert chainCerts key = defaultTlsSettings { 
+    certSettings = CertFromRef cert chainCerts key
+  }
 
 ----------------------------------------------------------------
 
@@ -236,31 +302,46 @@ runTLS :: TLSSettings -> Settings -> Application -> IO ()
 runTLS tset set app = withSocketsDo $
     bracket
         (bindPortTCP (getPort set) (getHost set))
-        sClose
+        close
         (\sock -> runTLSSocket tset set sock app)
 
 ----------------------------------------------------------------
 
+loadCredentials :: TLSSettings -> IO TLS.Credentials
+loadCredentials TLSSettings{ tlsCredentials = Just creds } = return creds
+loadCredentials TLSSettings{..} = case certSettings of 
+  CertFromFile cert chainFiles key -> do
+    cred <- either error id <$> TLS.credentialLoadX509Chain cert chainFiles key
+    return $ TLS.Credentials [cred]
+  CertFromRef certRef chainCertsRef keyRef -> do 
+    cert <- I.readIORef certRef
+    chainCerts <- mapM I.readIORef chainCertsRef
+    key <- I.readIORef keyRef
+    cred <- either error return $ TLS.credentialLoadX509ChainFromMemory cert chainCerts key
+    return $ TLS.Credentials [cred]
+  CertFromMemory certMemory chainCertsMemory keyMemory -> do
+    cred <- either error return $ TLS.credentialLoadX509ChainFromMemory certMemory chainCertsMemory keyMemory
+    return $ TLS.Credentials [cred]
+
+getSessionManager :: TLSSettings -> IO TLS.SessionManager
+getSessionManager TLSSettings{ tlsSessionManager = Just mgr } = return mgr
+getSessionManager TLSSettings{..} = case tlsSessionManagerConfig of
+      Nothing     -> return TLS.noSessionManager
+      Just config -> SM.newSessionManager config
+
 -- | Running 'Application' with 'TLSSettings' and 'Settings' using
 --   specified 'Socket'.
 runTLSSocket :: TLSSettings -> Settings -> Socket -> Application -> IO ()
-runTLSSocket tlsset@TLSSettings{..} set sock app = do
-    credential <- case (certMemory, keyMemory) of
-        (Nothing, Nothing) ->
-            either error id <$>
-            TLS.credentialLoadX509Chain certFile chainCertFiles keyFile
-        (mcert, mkey) -> do
-            cert <- maybe (S.readFile certFile) return mcert
-            key <- maybe (S.readFile keyFile) return mkey
-            either error return $
-              TLS.credentialLoadX509ChainFromMemory cert chainCertsMemory key
-    runTLSSocket' tlsset set credential sock app
+runTLSSocket tlsset set sock app = do
+    credentials <- loadCredentials tlsset
+    mgr <- getSessionManager tlsset
+    runTLSSocket' tlsset set credentials mgr sock app
 
-runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> Socket -> Application -> IO ()
-runTLSSocket' tlsset@TLSSettings{..} set credential sock app =
+runTLSSocket' :: TLSSettings -> Settings -> TLS.Credentials -> TLS.SessionManager -> Socket -> Application -> IO ()
+runTLSSocket' tlsset@TLSSettings{..} set credentials mgr sock app =
     runSettingsConnectionMakerSecure set get app
   where
-    get = getter tlsset sock params
+    get = getter tlsset set sock params
     params = def { -- TLS.ServerParams
         TLS.serverWantClientCert = tlsWantClientCert
       , TLS.serverCACertificates = []
@@ -268,6 +349,9 @@ runTLSSocket' tlsset@TLSSettings{..} set credential sock app =
       , TLS.serverHooks          = hooks
       , TLS.serverShared         = shared
       , TLS.serverSupported      = supported
+#if MIN_VERSION_tls(1,5,0)
+      , TLS.serverEarlyDataSize  = 2018
+#endif
       }
     -- Adding alpn to user's tlsServerHooks.
     hooks = tlsServerHooks {
@@ -275,101 +359,108 @@ runTLSSocket' tlsset@TLSSettings{..} set credential sock app =
           (if settingsHTTP2Enabled set then Just alpn else Nothing)
       }
     shared = def {
-        TLS.sharedCredentials = TLS.Credentials [credential]
+        TLS.sharedCredentials    = credentials
+      , TLS.sharedSessionManager = mgr
       }
     supported = def { -- TLS.Supported
         TLS.supportedVersions       = tlsAllowedVersions
       , TLS.supportedCiphers        = tlsCiphers
       , TLS.supportedCompressions   = [TLS.nullCompression]
-      , TLS.supportedHashSignatures = [
-          -- Safari 8 and go tls have bugs on SHA 512 and SHA 384.
-          -- So, we don't specify them here at this moment.
-          (TLS.HashSHA256, TLS.SignatureRSA)
-        , (TLS.HashSHA224, TLS.SignatureRSA)
-        , (TLS.HashSHA1,   TLS.SignatureRSA)
-        , (TLS.HashSHA1,   TLS.SignatureDSS)
-        ]
       , TLS.supportedSecureRenegotiation = True
       , TLS.supportedClientInitiatedRenegotiation = False
       , TLS.supportedSession             = True
       , TLS.supportedFallbackScsv        = True
+#if MIN_VERSION_tls(1,5,0)
+      , TLS.supportedGroups              = [TLS.X25519,TLS.P256,TLS.P384]
+#endif
       }
 
 alpn :: [S.ByteString] -> IO S.ByteString
 alpn xs
   | "h2"    `elem` xs = return "h2"
-  | "h2-16" `elem` xs = return "h2-16"
-  | "h2-15" `elem` xs = return "h2-15"
-  | "h2-14" `elem` xs = return "h2-14"
   | otherwise         = return "http/1.1"
 
 ----------------------------------------------------------------
 
-getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Transport), SockAddr)
-getter tlsset@TLSSettings{..} sock params = do
+getter :: TLS.TLSParams params => TLSSettings -> Settings -> Socket -> params -> IO (IO (Connection, Transport), SockAddr)
+getter tlsset set sock params = do
+#if WINDOWS
     (s, sa) <- windowsThreadBlockHack $ accept sock
-    return (mkConn tlsset s params, sa)
-  where
-  -- | Allow main socket listening thread to be interrupted on Windows platform
-  windowsThreadBlockHack :: IO a -> IO a
-  windowsThreadBlockHack act = do
-      var <- newEmptyMVar :: IO (MVar (Either SomeException a))
-      void . forkIO $ try act >>= putMVar var
-      res <- takeMVar var
-      case res of
-        Left  e -> throwIO e
-        Right r -> return r
+#else
+    (s, sa) <- accept sock
+#endif
+    setSocketCloseOnExec s
+    return (mkConn tlsset set s params, sa)
 
-mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport)
-mkConn tlsset s params = switch `onException` sClose s
+mkConn :: TLS.TLSParams params => TLSSettings -> Settings -> Socket -> params -> IO (Connection, Transport)
+mkConn tlsset set s params = switch `onException` close s
   where
     switch = do
         firstBS <- safeRecv s 4096
         if not (S.null firstBS) && S.head firstBS == 0x16 then
-            httpOverTls tlsset s firstBS params
+            httpOverTls tlsset set s firstBS params
           else
-            plainHTTP tlsset s firstBS
+            plainHTTP tlsset set s firstBS
 
 ----------------------------------------------------------------
 
-httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> S.ByteString -> params -> IO (Connection, Transport)
-httpOverTls TLSSettings{..} s bs0 params = do
+httpOverTls :: TLS.TLSParams params => TLSSettings -> Settings -> Socket -> S.ByteString -> params -> IO (Connection, Transport)
+httpOverTls TLSSettings{..} _set s bs0 params = do
     recvN <- makePlainReceiveN s bs0
     ctx <- TLS.contextNew (backend recvN) params
     TLS.contextHookSetLogging ctx tlsLogging
     TLS.handshake ctx
+    h2 <- (== Just "h2") <$> TLS.getNegotiatedProtocol ctx
+    isH2 <- I.newIORef h2
     writeBuf <- allocateBuffer bufferSize
     -- Creating a cache for leftover input data.
     ref <- I.newIORef ""
     tls <- getTLSinfo ctx
-    return (conn ctx writeBuf ref, tls)
+    return (conn ctx writeBuf ref isH2, tls)
   where
     backend recvN = TLS.Backend {
         TLS.backendFlush = return ()
-      , TLS.backendClose = sClose s
+#if MIN_VERSION_network(3,1,1)
+      , TLS.backendClose = gracefulClose s 5000 `E.catch` \(SomeException _) -> return ()
+#else
+      , TLS.backendClose = close s
+#endif
       , TLS.backendSend  = sendAll' s
       , TLS.backendRecv  = recvN
       }
-    sendAll' sock bs = sendAll sock bs `E.catch` \(SomeException _) ->
-        throwIO ConnectionClosedByPeer
-    conn ctx writeBuf ref = Connection {
+    sendAll' sock bs = E.handleJust
+      (\ e -> if ioeGetErrorType e == ResourceVanished
+        then Just ConnectionClosedByPeer
+        else Nothing)
+      throwIO
+      $ sendAll sock bs
+    conn ctx writeBuf ref isH2 = Connection {
         connSendMany         = TLS.sendData ctx . L.fromChunks
       , connSendAll          = sendall
       , connSendFile         = sendfile
-      , connClose            = close
+      , connClose            = close'
+      , connFree             = freeBuffer writeBuf
       , connRecv             = recv ref
       , connRecvBuf          = recvBuf ref
       , connWriteBuffer      = writeBuf
       , connBufferSize       = bufferSize
+      , connHTTP2            = isH2
       }
       where
         sendall = TLS.sendData ctx . L.fromChunks . return
         sendfile fid offset len hook headers =
             readSendFile writeBuf bufferSize sendall fid offset len hook headers
 
-        close = freeBuffer writeBuf `finally`
-                void (tryIO $ TLS.bye ctx) `finally`
-                TLS.contextClose ctx
+        close' = void (tryIO sendBye) `finally`
+                 TLS.contextClose ctx
+
+        sendBye =
+          -- It's fine if the connection was closed by the other side before
+          -- receiving close_notify, see RFC 5246 section 7.2.1.
+          handleJust
+            (\e -> guard (e == ConnectionClosedByPeer) >> return e)
+            (const (return ()))
+            (TLS.bye ctx)
 
         -- TLS version of recv with a cache for leftover input data.
         -- The cache is shared with recvBuf.
@@ -438,11 +529,16 @@ getTLSinfo ctx = do
                     TLS.TLS10 -> (3,1)
                     TLS.TLS11 -> (3,2)
                     TLS.TLS12 -> (3,3)
+#if MIN_VERSION_tls(1,5,0)
+                    TLS.TLS13 -> (3,4)
+#endif
+            clientCert <- TLS.getClientCertificateChain ctx
             return TLS {
                 tlsMajorVersion = major
               , tlsMinorVersion = minor
               , tlsNegotiatedProtocol = proto
               , tlsChiperID = TLS.cipherID infoCipher
+              , tlsClientCertificate = clientCert
               }
 
 tryIO :: IO a -> IO (Either IOException a)
@@ -450,10 +546,10 @@ tryIO = try
 
 ----------------------------------------------------------------
 
-plainHTTP :: TLSSettings -> Socket -> S.ByteString -> IO (Connection, Transport)
-plainHTTP TLSSettings{..} s bs0 = case onInsecure of
+plainHTTP :: TLSSettings -> Settings -> Socket -> S.ByteString -> IO (Connection, Transport)
+plainHTTP TLSSettings{..} set s bs0 = case onInsecure of
     AllowInsecure -> do
-        conn' <- socketConnection s
+        conn' <- socketConnection set s
         cachedRef <- I.newIORef bs0
         let conn'' = conn'
                 { connRecv = recvPlain cachedRef (connRecv conn')
@@ -475,7 +571,7 @@ plainHTTP TLSSettings{..} s bs0 = case onInsecure of
         \r\nConnection: Upgrade\
         \r\nContent-Type: text/plain\r\n\r\n"
         mapM_ (sendAll s) $ L.toChunks lbs
-        sClose s
+        close s
         throwIO InsecureConnectionDenied
 
 ----------------------------------------------------------------
@@ -497,4 +593,3 @@ recvPlain ref fallback = do
 data WarpTLSException = InsecureConnectionDenied
     deriving (Show, Typeable)
 instance Exception WarpTLSException
-

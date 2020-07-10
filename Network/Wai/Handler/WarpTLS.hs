@@ -4,7 +4,6 @@
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE PatternGuards #-}
-{-# LANGUAGE CPP #-}
 
 -- | HTTP over TLS support for Warp via the TLS package.
 --
@@ -43,9 +42,6 @@ module Network.Wai.Handler.WarpTLS (
     , DH.generateParams
     ) where
 
-#if __GLASGOW_HASKELL__ < 709
-import Control.Applicative ((<$>))
-#endif
 import Control.Applicative ((<|>))
 import Control.Exception (Exception, throwIO, bracket, finally, handle, fromException, try, IOException, onException, handleJust)
 import qualified Control.Exception as E
@@ -366,7 +362,7 @@ httpOverTls TLSSettings{..} _set s bs0 params = do
     backend recvN = TLS.Backend {
         TLS.backendFlush = return ()
 #if MIN_VERSION_network(3,1,1)
-      , TLS.backendClose = gracefulClose s 5000 `E.catch` \(E.SomeException _) -> return ()
+      , TLS.backendClose = gracefulClose s 5000 `E.catch` \(SomeException _) -> return ()
 #else
       , TLS.backendClose = close s
 #endif
@@ -538,4 +534,3 @@ recvPlain ref fallback = do
 data WarpTLSException = InsecureConnectionDenied
     deriving (Show, Typeable)
 instance Exception WarpTLSException
-
